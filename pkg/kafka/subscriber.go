@@ -1,60 +1,43 @@
 package kafka
 
 import (
-	"context"
 	"fmt"
 	"github.com/IBM/sarama"
-	"github/bulutcan99/kafka-pubsub/pkg/message"
-	"go.uber.org/zap"
+	"github.com/pkg/errors"
 	"sync"
 	"time"
 )
 
 type Subscriber struct {
-	config SubscriberConfig
-
-	closing       chan struct{}
+	consumer      sarama.Consumer
+	config        SubscriberConfig
 	subscribersWg sync.WaitGroup
-
-	closed bool
+	closed        chan struct{}
 }
 
-func NewSubscriber(
-	config SubscriberConfig,
-) (*Subscriber, error) {
+func NewSubscriber(config SubscriberConfig) (*Subscriber, error) {
 	config.setDefaults()
 
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 
-	return &Subscriber{
-		config: config,
+	consumer, err := sarama.NewConsumer(config.Brokers, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot create Kafka consumer")
+	}
 
-		closing: make(chan struct{}),
+	return &Subscriber{
+		config:   config,
+		consumer: consumer,
 	}, nil
 }
 
 type SubscriberConfig struct {
-	// Kafka brokers list.
-	Brokers []string
-
-	// Unmarshaler is used to unmarshal messages from Kafka format into Watermill format.
-	Unmarshaler UnmarshalerMessage
-
-	// OverwriteSaramaConfig holds additional sarama settings.
-	OverwriteSaramaConfig *sarama.Config
-
-	// Kafka consumer group.
-	// When empty, all messages from all partitions will be returned.
-	ConsumerGroup string
-
-	// How long after Nack message should be redelivered.
-	NackResendSleep time.Duration
-
-	// How long about unsuccessful reconnecting next reconnect will occur.
-	ReconnectRetrySleep time.Duration
-
+	Brokers                []string
+	OverwriteSaramaConfig  *sarama.Config
+	NackResendSleep        time.Duration
+	ReconnectRetrySleep    time.Duration
 	InitializeTopicDetails *sarama.TopicDetail
 }
 
@@ -74,83 +57,66 @@ func (c SubscriberConfig) Validate() error {
 	if len(c.Brokers) == 0 {
 		return fmt.Errorf("missing brokers")
 	}
-	if c.Unmarshaler == nil {
-		return fmt.Errorf("missing unmarshaler")
-	}
 
 	return nil
 }
 
 func DefaultSaramaSubscriberConfig() *sarama.Config {
 	config := sarama.NewConfig()
-
 	config.Version = sarama.V3_6_0_0
 	config.Consumer.Return.Errors = true
 	config.ClientID = "kafkaClient"
-
 	return config
 }
 
-func (s *Subscriber) Subscribe(topic string) (<-chan *message.Message, error) {
-	if s.closed {
-		return nil, fmt.Errorf("subscriber closed")
+func (s *Subscriber) Subscribe(topic string, handler func(msg *sarama.ConsumerMessage, userUUID string)) error {
+	if s.closed == nil {
+		return errors.New("cannot subscribe on closed subscriber")
 	}
 
-	s.subscribersWg.Add(1)
-	msgChan := make(chan *message.Message)
-	consumeClosed, err := s.consumeMessages(ctx, topic, output)
+	userUUid := "user-uuid"
+	partitions, err := s.consumer.Partitions(topic)
 	if err != nil {
-		s.subscribersWg.Done()
-		return nil, err
+		return errors.Wrap(err, "cannot retrieve partitions for topic")
 	}
 
-	go func() {
-		// blocking, until s.closing is closed
-		s.handleReconnects(ctx, topic, output, consumeClosed)
-		close(msgChan)
-		s.subscribersWg.Done()
-	}()
+	for _, partition := range partitions {
+		pc, err := s.consumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
+		if err != nil {
+			return errors.Wrap(err, "cannot consume partition")
+		}
 
-	return msgChan, nil
+		go func(pc sarama.PartitionConsumer) {
+			defer pc.Close()
+			for {
+				select {
+				case msg := <-pc.Messages():
+					handler(msg, userUUid)
+				case <-s.closed:
+					return
+				}
+			}
+		}(pc)
+	}
+
+	return nil
 }
 
-func (s *Subscriber) consumeMessages(ctx context.Context, topic string, output chan *message.Message) (consumeMsgClosing chan struct{}, err error) {
-	zap.S().Info("Consuming messages from kafka")
-	client, err := sarama.NewClient(s.config.Brokers, s.config.OverwriteSaramaConfig)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create kafka client: %w", err)
+func (s *Subscriber) HandleMessage(msg *sarama.ConsumerMessage, userUUID string) {
+	payload := string(msg.Value)
+	payloadWithUUID := fmt.Sprintf("%s - User UUID: %s", payload, userUUID)
+	fmt.Printf("Received message: %s\n", payloadWithUUID)
+}
+
+func (s *Subscriber) Close() error {
+	if s.closed == nil {
+		return nil
+	}
+	close(s.closed)
+
+	if err := s.consumer.Close(); err != nil {
+		return errors.Wrap(err, "cannot close Kafka consumer")
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		select {
-		case <-s.closing:
-			zap.S().Info("Closing kafka client")
-			cancel()
-		case <-ctx.Done():
-			return
-		}
-	}()
-
-	if s.config.ConsumerGroup == "" {
-		consumeMsgClosing, err = s.consumeWithoutConsumerGroups(ctx, client, topic, output)
-	} else {
-		consumeMsgClosing, err = s.consumeGroupMessages(ctx, client, topic, output)
-	}
-	if err != nil {
-		zap.S().Errorf("Error consuming messages from kafka: %s", err)
-		cancel()
-		return nil, err
-	}
-
-	go func() {
-		<-consumeMsgClosing
-		if err := client.Close(); err != nil {
-			zap.S().Errorf("Cannot close client: %s", err)
-		} else {
-			zap.S().Error("Client closed")
-		}
-	}()
-
-	return consumeMessagesClosed, nil
+	return nil
 }

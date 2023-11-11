@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/IBM/sarama"
 	"github.com/pkg/errors"
@@ -12,12 +13,11 @@ import (
 type Publisher struct {
 	config   PublisherConfig
 	producer sarama.SyncProducer
-	closed   bool
+	closed   chan struct{}
 }
 
 func NewPublisher(
 	config PublisherConfig,
-	logger zap.Logger,
 ) (*Publisher, error) {
 	config.setDefaults()
 	if err := config.Validate(); err != nil {
@@ -32,15 +32,12 @@ func NewPublisher(
 	return &Publisher{
 		config:   config,
 		producer: producer,
+		closed:   make(chan struct{}),
 	}, nil
 }
 
 type PublisherConfig struct {
-	// Kafka brokers list.
 	Brokers []string
-
-	// Marshaler is used to marshal messages from Watermill format into Kafka format.
-	Marshaler MarshalerMessage
 
 	// OverwriteSaramaConfig holds additional sarama settings.
 	OverwriteSaramaConfig *sarama.Config
@@ -55,9 +52,6 @@ func (c *PublisherConfig) setDefaults() {
 func (c PublisherConfig) Validate() error {
 	if len(c.Brokers) == 0 {
 		return fmt.Errorf("missing brokers")
-	}
-	if c.Marshaler == nil {
-		return fmt.Errorf("missing marshaler")
 	}
 
 	return nil
@@ -78,40 +72,42 @@ func DefaultSaramaSyncPublisherConfig() *sarama.Config {
 	return config
 }
 
-func (p *Publisher) Close() error {
-	if p.closed {
-		return nil
-	}
-	p.closed = true
-
-	if err := p.producer.Close(); err != nil {
-		return errors.Wrap(err, "cannot close Kafka producer")
-	}
-
-	return nil
-}
-
 func (p *Publisher) Publish(topic string, messages ...*message.Message) error {
-	if p.closed {
+	if p.closed == nil {
 		return errors.New("cannot publish on closed publisher")
 	}
 
 	producerMessages := make([]*sarama.ProducerMessage, len(messages))
 	for i, msg := range messages {
 		zap.S().Info("Publishing message to kafka")
-		producerMsg, err := p.config.Marshaler.Marshal(topic, msg)
+
+		payloadBytes, err := json.Marshal(msg.Payload)
 		if err != nil {
 			return err
+		}
+
+		producerMsg := &sarama.ProducerMessage{
+			Topic: topic,
+			Value: sarama.StringEncoder(payloadBytes),
 		}
 
 		producerMessages[i] = producerMsg
-	}
-
-	for _, msg := range producerMessages {
-		_, _, err := p.producer.SendMessage(msg)
+		_, _, err = p.producer.SendMessage(producerMsg)
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (p *Publisher) Close() error {
+	if p.closed == nil {
+		return nil
+	}
+
+	close(p.closed)
+	if err := p.producer.Close(); err != nil {
+		return errors.Wrap(err, "cannot close Kafka producer")
 	}
 
 	return nil

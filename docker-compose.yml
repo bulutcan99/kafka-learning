@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.3.1
+    depends_on:
+      - zookeeper
+    env_file:
+      - dev/docker-kafka.env
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENERS: EXTERNAL://0.0.0.0:9091,INTERNAL://0.0.0.0:29091
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:9091,INTERNAL://kafka1:29091
+    ports:
+      - "9092:9092"
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.1
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_SERVER_ID: 1
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+
+  app:
+    build: .
+    depends_on:
+      - kafka
+      - zookeeper
+    environment:
+      KAFKA_BROKERS: "kafka:9093"
+      KAFKA_TOPIC: "your-topic"
+

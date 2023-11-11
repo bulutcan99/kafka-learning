@@ -8,10 +8,6 @@ import (
 
 var closedchan = make(chan struct{})
 
-func init() {
-	close(closedchan)
-}
-
 // Payload is the Message's payload.
 type Payload []byte
 
@@ -26,11 +22,9 @@ const (
 // Message is the basic transfer unit.
 // Messages are emitted by Publishers and received by Subscribers.
 type Message struct {
-	// UUID is a unique identifier of message.
-	// It is only used by Watermill for debugging.
 	// UUID can be empty.
 	UUID    string
-	Payload Payload
+	Payload string
 	// ack is closed, when acknowledge is received.
 	ack chan struct{}
 	// noACk is closed, when negative acknowledge is received.
@@ -40,7 +34,7 @@ type Message struct {
 	ctx         context.Context
 }
 
-func NewMessage(payload Payload) *Message {
+func NewMessage(payload string) *Message {
 	return &Message{
 		UUID:    uuid.New().String(),
 		Payload: payload,
